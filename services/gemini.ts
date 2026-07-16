@@ -11,7 +11,7 @@
 
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
-const MODEL_NAME = "gemini-2.5-flash";
+const MODEL_NAME = "gemini-3-flash-preview";
 const MAX_ATTEMPTS = 3;
 const RETRY_DELAY_MS = 500;
 
