@@ -30,7 +30,7 @@ import { GoogleGenerativeAI } from "@google/generative-ai";
 // GEMINI_MODEL isn't set in the environment. Never hardcode a specific
 // model as the only option: set GEMINI_MODEL to change models without a
 // code change, and to avoid ever being stuck on a since-deprecated name.
-const DEFAULT_MODEL = "gemini-2.5-flash";
+const DEFAULT_MODEL = "gemini-3.1-flash-lite";
 
 function getModelName(): string {
   return process.env.GEMINI_MODEL || DEFAULT_MODEL;
