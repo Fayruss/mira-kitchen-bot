@@ -8,12 +8,67 @@
 // logic, in code) decides what to actually do with that JSON.
 //
 // The prompt template used below is documented in prompts/faq.md.
+//
+// Reliability/performance notes (Phase 1):
+// - Model is read from GEMINI_MODEL at call time — never hardcoded as
+//   the only option. If unset, falls back to DEFAULT_MODEL, a
+//   currently-supported stable Flash model. Rotating to a newer model
+//   is then just an env var change, no redeploy risk from a
+//   since-deprecated hardcoded name.
+// - No retry loop: exactly one Gemini request per call. A Vercel
+//   serverless function has a hard wall-clock limit; retrying a slow
+//   provider only multiplies the chance of hitting it (504) instead of
+//   reducing it.
+// - Every request is wrapped in an 8-second timeout (withTimeout, using
+//   AbortController) so a hung/slow Gemini call can never itself cause
+//   the function invocation to time out — it fails fast into the
+//   existing fallback response instead.
 
 import { GoogleGenerativeAI } from "@google/generative-ai";
 
-const MODEL_NAME = "gemini-3-flash-preview";
-const MAX_ATTEMPTS = 3;
-const RETRY_DELAY_MS = 500;
+// Currently-supported, stable Gemini Flash model — used only if
+// GEMINI_MODEL isn't set in the environment. Never hardcode a specific
+// model as the only option: set GEMINI_MODEL to change models without a
+// code change, and to avoid ever being stuck on a since-deprecated name.
+const DEFAULT_MODEL = "gemini-2.5-flash";
+
+function getModelName(): string {
+  return process.env.GEMINI_MODEL || DEFAULT_MODEL;
+}
+
+// 6s, not 10s: this function's caller has a hard ~10s wall-clock budget
+// (see maxDuration in app/api/telegram/route.ts), and a single request
+// also does session load/save and a Telegram send around this call.
+// Leaving only "8s timeout + a few hundred ms of overhead" cut it too
+// close to 10s in practice — 6s leaves real margin for the rest of the
+// request instead of the timeout itself risking a 504.
+const REQUEST_TIMEOUT_MS = 6000;
+
+// Guarantees a Gemini call resolves or fails within REQUEST_TIMEOUT_MS,
+// independent of whether the request itself ever settles — this is
+// what keeps a slow Gemini response from ever causing a Vercel function
+// invocation timeout. controller.abort() is also called so the request
+// is told to stop, on top of the caller receiving a timely rejection
+// either way.
+function withTimeout<T>(promise: Promise<T>, controller: AbortController): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error(`Gemini request timed out after ${REQUEST_TIMEOUT_MS}ms`));
+    }, REQUEST_TIMEOUT_MS);
+
+    promise.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
 
 export type GeminiIntent = "faq" | "menu" | "order" | "other";
 
@@ -24,8 +79,8 @@ export type GeminiResult = {
 
 const VALID_INTENTS: GeminiIntent[] = ["faq", "menu", "order", "other"];
 
-// Returned whenever Gemini can't be reached or gives back something we
-// can't parse, so the bot always has something safe to say.
+// Returned whenever Gemini can't be reached, times out, or gives back
+// something we can't parse, so the bot always has something safe to say.
 const FALLBACK_RESULT: GeminiResult = {
   intent: "other",
   reply: "Sorry, I didn't quite catch that. Could you rephrase?",
@@ -86,14 +141,11 @@ function parseGeminiResponse(rawText: string): GeminiResult {
   return { intent: parsed.intent, reply: parsed.reply };
 }
 
-function delay(ms: number): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
 // Sends a customer message to Gemini and returns a structured
-// interpretation. Retries on transient failures or malformed JSON.
-// Never throws — falls back to a safe default reply if every attempt
-// fails, so a Gemini outage never breaks the bot.
+// interpretation. Exactly one request — no retries. Never throws —
+// falls back to a safe default reply on any failure or timeout, so a
+// Gemini outage or slow response never breaks the bot or the function's
+// time budget.
 export async function understandMessage(
   userMessage: string,
   menuContext?: string,
@@ -107,26 +159,18 @@ export async function understandMessage(
     return FALLBACK_RESULT;
   }
 
-  const model = client.getGenerativeModel({ model: MODEL_NAME });
+  const model = client.getGenerativeModel({ model: getModelName() });
   const prompt = buildPrompt(userMessage, menuContext, pendingQuestion);
+  const controller = new AbortController();
 
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    try {
-      const result = await model.generateContent(prompt);
-      const text = result.response.text();
-      return parseGeminiResponse(text);
-    } catch (error) {
-      const isLastAttempt = attempt === MAX_ATTEMPTS;
-      console.error(`Gemini attempt ${attempt} failed:`, error);
-      if (isLastAttempt) {
-        return FALLBACK_RESULT;
-      }
-      await delay(RETRY_DELAY_MS * attempt);
-    }
+  try {
+    const result = await withTimeout(model.generateContent(prompt), controller);
+    const text = result.response.text();
+    return parseGeminiResponse(text);
+  } catch (error) {
+    console.error("Gemini request failed:", error);
+    return FALLBACK_RESULT;
   }
-
-  // Unreachable — the loop above always returns — but keeps TypeScript happy.
-  return FALLBACK_RESULT;
 }
 
 // ---------------------------------------------------------------------
@@ -224,52 +268,34 @@ function getRestaurantInfo(): string {
   return "No specific opening hours, delivery-area list, or business policies have been configured yet.";
 }
 
-// Only extracts a field when the customer actually stated it — Gemini
-// is explicitly told never to guess, and parsing below drops empty
-// strings back to undefined so a merge step downstream can't
-// accidentally overwrite known data with blanks.
+// Condensed on purpose (Phase 1: prompt was cut by roughly two-thirds
+// by tightening wording and removing repeated phrasing, while keeping
+// every context category and the exact same JSON schema/field
+// semantics as before — see prompts/faq.md for the full rationale).
 function buildExtractionPrompt(userMessage: string, context: ExtractionContext = {}): string {
   const { state, collected, menuContext, isOpen, recentHistory } = context;
 
-  const collectedLines = [
-    collected?.customerName ? `- Name: ${collected.customerName}` : null,
-    collected?.deliveryArea ? `- Delivery area: ${collected.deliveryArea}` : null,
-    collected?.items ? `- Items: ${collected.items}` : null,
-    collected?.quantity ? `- Quantity: ${collected.quantity}` : null,
-  ].filter(Boolean);
+  const known =
+    [
+      collected?.customerName && `name=${collected.customerName}`,
+      collected?.deliveryArea && `area=${collected.deliveryArea}`,
+      collected?.items && `items=${collected.items}`,
+      collected?.quantity && `qty=${collected.quantity}`,
+    ]
+      .filter(Boolean)
+      .join(", ") || "none";
 
   return [
-    "You are an order-taking assistant for a small restaurant on Telegram.",
-    "Read the customer's message and extract structured information as JSON.",
-    "",
-    "=== CONTEXT (use only these facts — never invent beyond them) ===",
-    state ? `Conversation status: ${state}` : null,
-    collectedLines.length > 0
-      ? `Already collected from this customer — do not ask for these again unless they want to change them:\n${collectedLines.join("\n")}`
-      : "Nothing has been collected from this customer yet.",
-    typeof isOpen === "boolean" ? `Kitchen status right now: ${isOpen ? "OPEN" : "CLOSED"}.` : null,
-    menuContext ? `Menu, with prices:\n${menuContext}` : "Menu: not available right now — don't guess prices or items.",
-    `Restaurant FAQ and business rules:\n${getRestaurantInfo()}`,
-    recentHistory && recentHistory.length > 0
-      ? `Recent conversation, oldest first:\n${recentHistory.map((m) => `- ${m}`).join("\n")}`
-      : null,
-    "=== END CONTEXT ===",
-    "",
-    "Respond with ONLY strict JSON, no markdown, in exactly this shape:",
-    '{"intent": "place_order" | "ask_menu" | "ask_price" | "ask_opening_hours" | "ask_delivery" | "ask_general" | "confirm_order" | "edit_order" | "cancel_order" | "greeting" | "unknown", "customer_name": "", "delivery_area": "", "items": [], "quantity": "", "question": "", "correction": false, "confirmation": false, "cancel": false, "confidence": 0, "reply": ""}',
-    "Rules:",
-    "- Only fill customer_name, delivery_area, items, or quantity if the message actually states them. Never guess — leave empty otherwise.",
-    '- items: menu items the customer mentioned, as they said them, including a quantity if given, in any phrasing (e.g. "2 Jollof Rice", "Jollof Rice x2", "two jollof rice" — convert word numbers like "two" to digits). Use one array entry per distinct item.',
-    "- quantity: only a bare count (e.g. \"3\") when the customer is answering how many of a single, already-named item — separate from items.",
-    '- correction: true ONLY if the customer is replacing/changing/removing an item or value they already gave (e.g. "actually make it fried rice instead", "remove the chicken", "change my area to Lekki"). When correction is true and items are involved, "items" must be the COMPLETE updated list of everything the customer wants going forward (combine the "Already collected" items with the change, e.g. keep the ones not mentioned) — never just the one item that changed, since this replaces the whole list. If they are ADDING something new on top of what\'s already collected instead (e.g. "also add a drink", "can I get a coke too"), set correction to false and list only the new item(s) — do not repeat items already collected, those are kept automatically.',
-    "- If the customer says they want to change something but doesn't give the new value (e.g. \"I want to change my delivery area\" with no area named), leave that field empty and set reply to ask for the new value — don't silently do nothing.",
-    "- confirmation: true if the customer is confirming/agreeing to place the order as summarized so far.",
-    "- cancel: true if the customer wants to cancel or abandon the order.",
-    "- question: the customer's question in their own words, if they asked one. If they asked more than one question, combine them here.",
-    "- reply: a short (1-2 sentences, longer only if genuinely needed — e.g. to cover multiple questions, or to list the full menu when asked what's available), friendly, restaurant-specific answer if the customer asked a question (answer ALL questions asked, even if there are several in one message), made small talk, or just greeted you. Leave empty only for a plain order/info statement with nothing to respond to.",
-    "- confidence: 0 to 1, how confident you are in this extraction.",
-    "- CRITICAL: base every answer only on the CONTEXT above (menu, prices, kitchen status, FAQ/business rules, what's already collected). If the customer asks something this context doesn't cover — a price not on the menu, hours, a policy, anything — your reply must honestly say you don't have that information, and suggest they ask the restaurant directly if appropriate. Never invent or assume an answer.",
-    `Customer message: "${userMessage}"`,
+    "Restaurant order-taking assistant. Extract JSON from the customer message below. Use ONLY the facts given here — if something isn't covered, say so honestly in reply instead of guessing.",
+    state ? `Status: ${state}` : null,
+    `Known: ${known}`,
+    typeof isOpen === "boolean" ? `Kitchen: ${isOpen ? "open" : "closed"}` : null,
+    menuContext ? `Menu:\n${menuContext}` : "Menu: unavailable",
+    `FAQ/rules: ${getRestaurantInfo()}`,
+    recentHistory && recentHistory.length > 0 ? `Recent: ${recentHistory.join(" | ")}` : null,
+    'Return ONLY this JSON: {"intent":"place_order|ask_menu|ask_price|ask_opening_hours|ask_delivery|ask_general|confirm_order|edit_order|cancel_order|greeting|unknown","customer_name":"","delivery_area":"","items":[],"quantity":"","question":"","correction":false,"confirmation":false,"cancel":false,"confidence":0,"reply":""}',
+    'Fill a field only if stated (never guess). items: as said, with quantity if given (word-numbers like "two" as digits); one entry per item. quantity: bare count answering "how many" for a single known item. correction=true only when replacing/removing something already known — then items must be the FULL updated list; adding something new instead is correction=false with only the new item(s). Change requested with no new value given: leave field empty, ask for it in reply. reply: brief answer to any question(s)/small talk, empty only for a plain order statement; list the full menu if asked what\'s available.',
+    `Message: "${userMessage}"`,
   ]
     .filter(Boolean)
     .join("\n");
@@ -311,10 +337,10 @@ function parseExtractionResponse(rawText: string): ExtractedOrderInfo {
 }
 
 // Extracts structured slot data (+ an optional natural-language reply)
-// from a single customer message. Retries on transient failures or
-// malformed JSON, same as understandMessage. Never throws — falls back
-// to a safe "please rephrase" result so a Gemini outage never breaks
-// the conversation.
+// from a single customer message. Exactly one Gemini request — no
+// retries. Never throws — falls back to a safe "please rephrase" result
+// on any failure or timeout, so a Gemini outage or slow response never
+// breaks the conversation or risks a Vercel function timeout.
 export async function extractOrderInfo(
   userMessage: string,
   context?: ExtractionContext
@@ -327,24 +353,16 @@ export async function extractOrderInfo(
     return FALLBACK_EXTRACTION;
   }
 
-  const model = client.getGenerativeModel({ model: MODEL_NAME });
+  const model = client.getGenerativeModel({ model: getModelName() });
   const prompt = buildExtractionPrompt(userMessage, context);
+  const controller = new AbortController();
 
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    try {
-      const result = await model.generateContent(prompt);
-      const text = result.response.text();
-      return parseExtractionResponse(text);
-    } catch (error) {
-      const isLastAttempt = attempt === MAX_ATTEMPTS;
-      console.error(`Gemini extraction attempt ${attempt} failed:`, error);
-      if (isLastAttempt) {
-        return FALLBACK_EXTRACTION;
-      }
-      await delay(RETRY_DELAY_MS * attempt);
-    }
+  try {
+    const result = await withTimeout(model.generateContent(prompt), controller);
+    const text = result.response.text();
+    return parseExtractionResponse(text);
+  } catch (error) {
+    console.error("Gemini extraction failed:", error);
+    return FALLBACK_EXTRACTION;
   }
-
-  // Unreachable — the loop above always returns — but keeps TypeScript happy.
-  return FALLBACK_EXTRACTION;
 }

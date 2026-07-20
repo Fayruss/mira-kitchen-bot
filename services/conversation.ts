@@ -2,10 +2,17 @@
 // Responsibility: the Conversation Engine.
 //
 // Routes an incoming message to a reply. /start always resets first.
-// Admin commands are handled next: /open, /close, /menu are single-shot;
-// /additem, /edititem, /removeitem are guided, multi-step flows (see the
-// "Admin menu management" section below) that read/write the existing
-// menu_items table — no SQL, Supabase, or code required from Mira.
+// Admin commands are handled next: /open, /close, /menu, /orders,
+// /settings are single-shot; /additem, /edititem, /removeitem are
+// guided, multi-step flows (see the "Admin menu management" section
+// below). Beyond exact commands/buttons, an admin can also edit the
+// menu with natural language ("burger is now 4000", "remove burger") —
+// see the "Natural-language admin commands" section, which is fully
+// deterministic (services/menuActions.ts — no Gemini, so this can never
+// be reached from the customer-facing NLU path) and funnels into the
+// exact same applyAddItem/applyItemEdit/applyRemoveItem functions the
+// guided flows use, so there is one code path per mutation regardless
+// of how it was triggered.
 // Otherwise, for a normal customer message:
 //
 //   1. A handful of deterministic, Gemini-free checks first (cancel,
@@ -32,20 +39,21 @@
 
 import { Session, ConversationState } from "./sessions";
 import { isKitchenOpen, openKitchen, closeKitchen } from "./availability";
-import { saveOrder, notifyAdmin } from "./orders";
+import { saveOrder, notifyAdmin, listRecentOrders, OrderRecord } from "./orders";
 import { getMenuText, listMenuItems, addMenuItem, updateMenuItem, deleteMenuItem, MenuItem } from "./menu";
-import { getAdminChatId } from "@/lib/env";
+import { parseMenuActionText, looksLikeMenuActionAttempt } from "./menuActions";
+import { getAdminChatIds } from "@/lib/env";
 import { extractOrderInfo, ExtractedOrderInfo, ExtractionContext } from "./gemini";
+import { sendMessageWithKeyboard, ReplyKeyboardMarkup, ReplyKeyboardRemove } from "./telegram";
 
-const ADMIN_COMMANDS = ["/open", "/close", "/menu", "/additem", "/edititem", "/removeitem"];
+const ADMIN_COMMANDS = ["/open", "/close", "/menu", "/additem", "/edititem", "/removeitem", "/orders", "/settings"];
 
 export function isAdminCommand(text: string): boolean {
   return ADMIN_COMMANDS.includes(text.trim().toLowerCase());
 }
 
 function isAuthorizedAdmin(chatId: number): boolean {
-  const adminChatId = getAdminChatId();
-  return adminChatId !== null && chatId === adminChatId;
+  return getAdminChatIds().includes(chatId);
 }
 
 async function handleAdminCommand(session: Session, text: string): Promise<string> {
@@ -56,14 +64,16 @@ async function handleAdminCommand(session: Session, text: string): Promise<strin
   switch (text.trim().toLowerCase()) {
     case "/open":
       await openKitchen();
-      return "Kitchen is now OPEN. Customers can place orders.";
+      return finishAdminAction(session, "Kitchen is now OPEN. Customers can place orders.");
 
     case "/close":
       await closeKitchen();
-      return "Kitchen is now CLOSED. Customers cannot place new orders.";
+      return finishAdminAction(session, "Kitchen is now CLOSED. Customers cannot place new orders.");
 
-    case "/menu":
-      return await getMenuText();
+    case "/menu": {
+      const menuText = await getMenuText();
+      return finishAdminAction(session, menuText);
+    }
 
     case "/additem":
       return startAddItemFlow(session);
@@ -74,9 +84,151 @@ async function handleAdminCommand(session: Session, text: string): Promise<strin
     case "/removeitem":
       return startRemoveItemFlow(session);
 
+    case "/orders": {
+      const ordersText = await buildRecentOrdersText();
+      return finishAdminAction(session, ordersText);
+    }
+
+    case "/settings": {
+      const settingsText = await buildSettingsText();
+      return finishAdminAction(session, settingsText);
+    }
+
     default:
       return "Unknown admin command.";
   }
+}
+
+// ---------------------------------------------------------------------
+// Admin Mode: role separation so the restaurant owner never goes
+// through the customer order flow. Any message from an authorized admin
+// (ADMIN_IDS, or the legacy ADMIN_CHAT_ID) is routed here instead of
+// ever reaching handleCustomerMessage — see routeConversation. A
+// persistent button menu (Telegram ReplyKeyboardMarkup) means Mira
+// almost never needs to remember a command; typed slash commands still
+// work too, for anyone who prefers that.
+// ---------------------------------------------------------------------
+
+const ADMIN_BUTTON_LABELS: Record<string, string> = {
+  "📋 Menu": "/menu",
+  "➕ Add Item": "/additem",
+  "✏ Edit Item": "/edititem",
+  "❌ Remove Item": "/removeitem",
+  "🟢 Open Kitchen": "/open",
+  "🔴 Close Kitchen": "/close",
+  "📦 Recent Orders": "/orders",
+  "⚙ Settings": "/settings",
+};
+
+// Bare, no-punctuation navigation words — case-insensitive. Separate
+// from item-edit natural language (menuActions.ts): typing "menu" or
+// "orders" has no sensible clarification fallback the way an ambiguous
+// item edit does, so these are matched directly instead.
+const ADMIN_BARE_WORD_COMMANDS: Record<string, string> = {
+  menu: "/menu",
+  orders: "/orders",
+  "recent orders": "/orders",
+  settings: "/settings",
+  open: "/open",
+  "open kitchen": "/open",
+  close: "/close",
+  "close kitchen": "/close",
+};
+
+// Maps a button tap, a typed slash command, or a bare navigation word
+// to the canonical command handleAdminCommand understands. Returns
+// null for anything else (a greeting, small talk, an unrecognized
+// message) — routeConversation tries natural-language menu editing
+// next, then shows the dashboard again if that doesn't match either.
+function resolveAdminInput(text: string): string | null {
+  const trimmed = text.trim();
+  if (isAdminCommand(trimmed)) {
+    return trimmed.toLowerCase();
+  }
+  if (ADMIN_BUTTON_LABELS[trimmed]) {
+    return ADMIN_BUTTON_LABELS[trimmed];
+  }
+  return ADMIN_BARE_WORD_COMMANDS[trimmed.toLowerCase()] ?? null;
+}
+
+function buildAdminKeyboard(isOpen: boolean): ReplyKeyboardMarkup {
+  return {
+    keyboard: [
+      ["📋 Menu", "📦 Recent Orders"],
+      ["➕ Add Item", "✏ Edit Item"],
+      ["❌ Remove Item", isOpen ? "🔴 Close Kitchen" : "🟢 Open Kitchen"],
+      ["⚙ Settings"],
+    ],
+    resize_keyboard: true,
+  };
+}
+
+// Shows the Admin Mode dashboard: greeting, current kitchen status, and
+// the button menu. Sent directly (not returned as a string) so the
+// keyboard can be attached — callers return the "" this resolves to,
+// which routeConversation/the webhook route treats as "already sent,
+// nothing more to do".
+async function sendAdminDashboard(session: Session): Promise<string> {
+  const open = await isKitchenOpen();
+  const text = ["Hi Mira 👋", `Kitchen: ${open ? "🟢 Open" : "🔴 Closed"}`, "Choose an option:"].join("\n");
+  await sendMessageWithKeyboard(session.chatId, text, buildAdminKeyboard(open));
+  return "";
+}
+
+// Sends the result of an admin action together with a freshly-built
+// keyboard (so, e.g., the Open/Close Kitchen button immediately flips
+// to match the new status) — one message instead of a separate
+// confirmation + dashboard pair.
+async function finishAdminAction(session: Session, message: string): Promise<string> {
+  const open = await isKitchenOpen();
+  await sendMessageWithKeyboard(session.chatId, message, buildAdminKeyboard(open));
+  return "";
+}
+
+// Sends the first prompt of a guided text-entry flow (/additem,
+// /edititem, /removeitem) and hides the button keyboard for its
+// duration — otherwise a button tap mid-flow (e.g. "❌ Remove Item"
+// tapped while answering "what's the new item's name?") would be read
+// as literal text input for that step. The keyboard reappears via
+// finishAdminAction once the flow ends (see the continue*Flow functions).
+async function startAdminGuidedFlow(session: Session, prompt: string): Promise<string> {
+  await sendMessageWithKeyboard(session.chatId, prompt, { remove_keyboard: true });
+  return "";
+}
+
+async function buildRecentOrdersText(): Promise<string> {
+  let orders: OrderRecord[];
+  try {
+    orders = await listRecentOrders(10);
+  } catch (error) {
+    console.error("Failed to load recent orders:", error);
+    return "Sorry, I couldn't load recent orders right now. Please try again in a moment.";
+  }
+
+  if (orders.length === 0) {
+    return "No orders yet.";
+  }
+
+  const lines = orders.map((order) => {
+    const when = new Date(order.createdAt).toLocaleString("en-US", {
+      dateStyle: "medium",
+      timeStyle: "short",
+    });
+    return `• ${order.customerName} (${order.deliveryArea}) — ${order.items}, qty ${order.quantity} — ${when}`;
+  });
+
+  return ["📦 Recent orders:", ...lines].join("\n");
+}
+
+async function buildSettingsText(): Promise<string> {
+  const open = await isKitchenOpen();
+  const adminIds = getAdminChatIds();
+  return [
+    "⚙ Settings",
+    `Kitchen: ${open ? "🟢 Open" : "🔴 Closed"}`,
+    `Admin chat ID(s): ${adminIds.length > 0 ? adminIds.join(", ") : "none configured"}`,
+    "To update opening hours, delivery rules, or FAQ answers, set the RESTAURANT_FAQ environment variable — no code change needed.",
+  ].join("\n");
 }
 
 const WELCOME_MESSAGE = "Welcome to Mira's Kitchen! What's your name?";
@@ -234,39 +386,45 @@ function saveFailedMessage(action: string, command: string): string {
   return `Sorry, something went wrong ${action} that item. Please try ${command} again.`;
 }
 
-function startAddItemFlow(session: Session): string {
+async function startAddItemFlow(session: Session): Promise<string> {
   clearOrderFields(session);
   session.state = "ADMIN_ADD_ITEM";
   setAdminDraft(session, { step: "name" } satisfies AddItemDraft);
-  return 'Let\'s add a new menu item. What\'s the name? (Reply "cancel" anytime to stop.)';
+  return startAdminGuidedFlow(session, 'Let\'s add a new menu item. What\'s the name? (Reply "cancel" anytime to stop.)');
 }
 
 async function startEditItemFlow(session: Session): Promise<string> {
   const items = await listMenuItemsForAdmin();
   if (items === null) {
-    return menuLoadFailedMessage("/edititem");
+    return finishAdminAction(session, menuLoadFailedMessage("/edititem"));
   }
   if (items.length === 0) {
-    return "The menu is empty right now — use /additem to add the first item.";
+    return finishAdminAction(session, "The menu is empty right now — use /additem to add the first item.");
   }
   clearOrderFields(session);
   session.state = "ADMIN_EDIT_ITEM";
   setAdminDraft(session, { step: "select", items } satisfies EditItemDraft);
-  return `Which item would you like to edit? Reply with the number.\n${formatSelectableList(items)}\n\n(Reply "cancel" anytime to stop.)`;
+  return startAdminGuidedFlow(
+    session,
+    `Which item would you like to edit? Reply with the number.\n${formatSelectableList(items)}\n\n(Reply "cancel" anytime to stop.)`
+  );
 }
 
 async function startRemoveItemFlow(session: Session): Promise<string> {
   const items = await listMenuItemsForAdmin();
   if (items === null) {
-    return menuLoadFailedMessage("/removeitem");
+    return finishAdminAction(session, menuLoadFailedMessage("/removeitem"));
   }
   if (items.length === 0) {
-    return "The menu is already empty — nothing to remove.";
+    return finishAdminAction(session, "The menu is already empty — nothing to remove.");
   }
   clearOrderFields(session);
   session.state = "ADMIN_REMOVE_ITEM";
   setAdminDraft(session, { step: "select", items } satisfies RemoveItemDraft);
-  return `Which item would you like to remove? Reply with the number.\n${formatSelectableList(items)}\n\n(Reply "cancel" anytime to stop.)`;
+  return startAdminGuidedFlow(
+    session,
+    `Which item would you like to remove? Reply with the number.\n${formatSelectableList(items)}\n\n(Reply "cancel" anytime to stop.)`
+  );
 }
 
 function selectFromList(items: MenuItem[], text: string): MenuItem | null {
@@ -277,11 +435,71 @@ function selectFromList(items: MenuItem[], text: string): MenuItem | null {
   return items[index - 1];
 }
 
+// ---------------------------------------------------------------------
+// Single source of truth for actually mutating the menu. Every trigger
+// path — the guided /additem, /edititem, /removeitem flows AND the
+// natural-language commands below — ends up calling exactly one of
+// these three functions. There is no second place in the codebase that
+// calls addMenuItem/updateMenuItem/deleteMenuItem.
+// ---------------------------------------------------------------------
+
+async function applyAddItem(session: Session, name: string, price: number, available: boolean): Promise<string> {
+  try {
+    await addMenuItem(name, price, available);
+  } catch (error) {
+    console.error("Failed to add menu item:", error);
+    return finishAdminAction(session, saveFailedMessage("saving", "/additem"));
+  }
+  return finishAdminAction(session, `Added "${name}" — $${price}${available ? "" : " (unavailable)"}.`);
+}
+
+async function applyItemEdit(
+  session: Session,
+  itemId: string,
+  itemName: string,
+  field: EditableField,
+  value: string | number | boolean
+): Promise<string> {
+  let updates: Partial<{ name: string; price: number; available: boolean }>;
+  let confirmationDetail: string;
+
+  if (field === "name") {
+    updates = { name: value as string };
+    confirmationDetail = `name changed to "${value}"`;
+  } else if (field === "price") {
+    updates = { price: value as number };
+    confirmationDetail = `price changed to $${value}`;
+  } else {
+    const available = value as boolean;
+    updates = { available };
+    confirmationDetail = `now marked ${available ? "available" : "unavailable"}`;
+  }
+
+  try {
+    await updateMenuItem(itemId, updates);
+  } catch (error) {
+    console.error("Failed to update menu item:", error);
+    return finishAdminAction(session, saveFailedMessage("updating", "/edititem"));
+  }
+
+  return finishAdminAction(session, `Updated "${itemName}" — ${confirmationDetail}.`);
+}
+
+async function applyRemoveItem(session: Session, itemId: string, itemName: string): Promise<string> {
+  try {
+    await deleteMenuItem(itemId);
+  } catch (error) {
+    console.error("Failed to delete menu item:", error);
+    return finishAdminAction(session, saveFailedMessage("removing", "/removeitem"));
+  }
+  return finishAdminAction(session, `Removed "${itemName}" from the menu.`);
+}
+
 async function continueAddItemFlow(session: Session, text: string): Promise<string> {
   const draft = getAdminDraft<AddItemDraft>(session);
   if (!draft) {
     session.state = "START";
-    return draftLostMessage("/additem");
+    return finishAdminAction(session, draftLostMessage("/additem"));
   }
 
   if (draft.step === "name") {
@@ -312,25 +530,16 @@ async function continueAddItemFlow(session: Session, text: string): Promise<stri
   const available = isAffirmative(text);
   const { name, price } = draft;
 
-  try {
-    await addMenuItem(name!, price!, available);
-  } catch (error) {
-    console.error("Failed to add menu item:", error);
-    clearAdminDraft(session);
-    session.state = "START";
-    return saveFailedMessage("saving", "/additem");
-  }
-
   clearAdminDraft(session);
   session.state = "START";
-  return `Added "${name}" — $${price}${available ? "" : " (unavailable)"}. Reply /menu to see the full list.`;
+  return applyAddItem(session, name!, price!, available);
 }
 
 async function continueEditItemFlow(session: Session, text: string): Promise<string> {
   const draft = getAdminDraft<EditItemDraft>(session);
   if (!draft) {
     session.state = "START";
-    return draftLostMessage("/edititem");
+    return finishAdminAction(session, draftLostMessage("/edititem"));
   }
 
   if (draft.step === "select") {
@@ -361,50 +570,37 @@ async function continueEditItemFlow(session: Session, text: string): Promise<str
   // draft.step === "value"
   const field = draft.field!;
   const itemName = draft.itemName!;
-  let updates: Partial<{ name: string; price: number; available: boolean }>;
-  let confirmationDetail: string;
+  const itemId = draft.itemId!;
+  let value: string | number | boolean;
 
   if (field === "name") {
     if (!text.trim()) {
       return "What's the new name?";
     }
-    updates = { name: text.trim() };
-    confirmationDetail = `name changed to "${text.trim()}"`;
+    value = text.trim();
   } else if (field === "price") {
     const price = parsePriceInput(text);
     if (price === null) {
       return "Please reply with just the new price as a number, e.g. 1500.";
     }
-    updates = { price };
-    confirmationDetail = `price changed to $${price}`;
+    value = price;
   } else {
     if (!isAffirmative(text) && !isNegative(text)) {
       return 'Please reply "yes" or "no".';
     }
-    const available = isAffirmative(text);
-    updates = { available };
-    confirmationDetail = `now marked ${available ? "available" : "unavailable"}`;
-  }
-
-  try {
-    await updateMenuItem(draft.itemId!, updates);
-  } catch (error) {
-    console.error("Failed to update menu item:", error);
-    clearAdminDraft(session);
-    session.state = "START";
-    return saveFailedMessage("updating", "/edititem");
+    value = isAffirmative(text);
   }
 
   clearAdminDraft(session);
   session.state = "START";
-  return `Updated "${itemName}" — ${confirmationDetail}.`;
+  return applyItemEdit(session, itemId, itemName, field, value);
 }
 
 async function continueRemoveItemFlow(session: Session, text: string): Promise<string> {
   const draft = getAdminDraft<RemoveItemDraft>(session);
   if (!draft) {
     session.state = "START";
-    return draftLostMessage("/removeitem");
+    return finishAdminAction(session, draftLostMessage("/removeitem"));
   }
 
   if (draft.step === "select") {
@@ -423,23 +619,15 @@ async function continueRemoveItemFlow(session: Session, text: string): Promise<s
   if (!isAffirmative(text)) {
     clearAdminDraft(session);
     session.state = "START";
-    return "No changes made.";
+    return finishAdminAction(session, "No changes made.");
   }
 
+  const itemId = draft.itemId!;
   const itemName = draft.itemName!;
-
-  try {
-    await deleteMenuItem(draft.itemId!);
-  } catch (error) {
-    console.error("Failed to delete menu item:", error);
-    clearAdminDraft(session);
-    session.state = "START";
-    return saveFailedMessage("removing", "/removeitem");
-  }
 
   clearAdminDraft(session);
   session.state = "START";
-  return `Removed "${itemName}" from the menu.`;
+  return applyRemoveItem(session, itemId, itemName);
 }
 
 // Entry point for continuing an in-progress admin menu flow. "cancel"
@@ -449,7 +637,7 @@ async function continueAdminMenuFlow(session: Session, text: string): Promise<st
   if (isCancelWord(text.trim().toLowerCase())) {
     clearAdminDraft(session);
     session.state = "START";
-    return "Cancelled — no changes made.";
+    return finishAdminAction(session, "Cancelled — no changes made.");
   }
 
   switch (session.state) {
@@ -464,7 +652,7 @@ async function continueAdminMenuFlow(session: Session, text: string): Promise<st
       // isAdminMenuFlowState(session.state) is true — but keeps
       // TypeScript happy and fails safely if that ever changes.
       session.state = "START";
-      return "Something went wrong — let's start over. Send /menu, /additem, /edititem, or /removeitem.";
+      return finishAdminAction(session, "Something went wrong — let's start over.");
   }
 }
 
@@ -790,30 +978,123 @@ async function handleCustomerMessage(session: Session, text: string): Promise<st
   return respondBasedOnMissingFields(session);
 }
 
+// ---------------------------------------------------------------------
+// Natural-language admin commands: "burger is now 4000", "remove
+// burger", "add fries 1500", plus slash commands with inline args
+// ("/edititem Burger 4000"). Fully deterministic (services/menuActions.ts
+// — no Gemini), and only ever called from the authenticated-admin
+// branch of routeConversation below, so a customer can never reach this
+// even by sending the exact same text. Resolves into the same
+// applyAddItem/applyItemEdit/applyRemoveItem functions the guided flows
+// use — one code path per mutation regardless of trigger.
+// ---------------------------------------------------------------------
+
+// Returns null when the text doesn't look like a menu-editing attempt
+// at all (routeConversation falls back to showing the dashboard), or
+// the reply after handling it (an action taken, or one clarification
+// question if the intent was ambiguous — never both a guess and a
+// mutation).
+async function tryHandleMenuActionText(session: Session, text: string): Promise<string | null> {
+  if (!looksLikeMenuActionAttempt(text)) {
+    return null;
+  }
+
+  const items = await listMenuItemsForAdmin();
+  if (items === null) {
+    // Supabase hiccup — fall back to the dashboard rather than a
+    // confusing error for what might not even have been a menu-edit
+    // attempt in the first place.
+    return null;
+  }
+
+  const action = parseMenuActionText(text, items);
+
+  switch (action.type) {
+    case "none":
+      return null;
+
+    case "ambiguous":
+      return finishAdminAction(session, action.question);
+
+    case "add":
+      return applyAddItem(session, action.name, action.price, true);
+
+    case "edit":
+      return applyItemEdit(session, action.item.id, action.item.name, "price", action.price);
+
+    case "remove":
+      // Route through the exact same confirmation step the guided
+      // /removeitem flow uses, rather than deleting immediately —
+      // deletions are the one destructive action here, so a
+      // fuzzy-matched natural-language trigger still gets a safety
+      // check before anything is removed.
+      session.state = "ADMIN_REMOVE_ITEM";
+      setAdminDraft(session, {
+        step: "confirm",
+        items: [action.item],
+        itemId: action.item.id,
+        itemName: action.item.name,
+      } satisfies RemoveItemDraft);
+      return startAdminGuidedFlow(
+        session,
+        `Remove "${action.item.name}" — $${action.item.price}? Reply "yes" to confirm, or "cancel" to stop.`
+      );
+  }
+}
+
 // Entry point for the webhook: mutates the session in place and returns
-// the reply text to send back to the user. Caller is responsible for
-// persisting the session with saveSession() afterwards.
+// the reply text to send back to the user (or "" if the reply was
+// already sent directly, e.g. an Admin Mode message with a keyboard —
+// see the webhook route, which skips its own send in that case).
+// Caller is responsible for persisting the session with saveSession()
+// afterwards.
 export async function routeConversation(session: Session, text: string): Promise<string> {
-  // /start always resets first, before anything else — admin check,
-  // availability, everything. Also abandons any in-progress admin
-  // menu-management flow.
+  const isAdmin = isAuthorizedAdmin(session.chatId);
+
+  // /start always resets first, before anything else. For an admin this
+  // means straight into Admin Mode — never the customer greeting.
   if (isStartCommand(text)) {
     clearOrderFields(session);
     clearAdminDraft(session);
     session.history = [];
+    if (isAdmin) {
+      return sendAdminDashboard(session);
+    }
     session.state = "COLLECT_NAME";
     return WELCOME_MESSAGE;
   }
 
   // An authorized admin mid-way through /additem, /edititem, or
   // /removeitem gets their plain replies ("Jollof Rice", "1500", "yes")
-  // routed to that flow — checked before the generic admin-command
-  // dispatch below, since these replies aren't slash commands
-  // themselves.
-  if (isAdminMenuFlowState(session.state) && isAuthorizedAdmin(session.chatId)) {
+  // routed to that flow.
+  if (isAdmin && isAdminMenuFlowState(session.state)) {
     return continueAdminMenuFlow(session, text);
   }
 
+  // Role separation: an authorized admin NEVER enters the customer
+  // order flow, regardless of what they type. Every message either
+  // resolves to a recognized command/button (Menu, Add Item, Open
+  // Kitchen, ...), a natural-language menu edit, or falls back to
+  // showing the Admin Mode dashboard again — never "What's your name?"
+  // / "Delivery area?" / "What would you like to order?".
+  if (isAdmin) {
+    const resolvedCommand = resolveAdminInput(text);
+    if (resolvedCommand) {
+      return handleAdminCommand(session, resolvedCommand);
+    }
+
+    const menuActionReply = await tryHandleMenuActionText(session, text);
+    if (menuActionReply !== null) {
+      return menuActionReply;
+    }
+
+    return sendAdminDashboard(session);
+  }
+
+  // Customer path — unchanged. tryHandleMenuActionText is never called
+  // here, so a customer sending the exact same text ("burger 4000",
+  // "remove burger") can never trigger a menu mutation — it's just
+  // handled as an ordinary order-flow/FAQ message below.
   if (isAdminCommand(text)) {
     return handleAdminCommand(session, text);
   }

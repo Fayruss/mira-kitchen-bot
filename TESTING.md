@@ -26,6 +26,30 @@ availability, or orders. Each item names what it's actually verifying.
       → routes back to "what would you like to order?" instead of
       silently placing the order
 
+## Admin Mode (role separation)
+
+- [ ] Message the bot from an admin chat (any text — "hi", random words,
+      anything not a recognized command/button) → Admin Mode dashboard
+      appears ("Hi Mira 👋", kitchen status, button menu) — **never**
+      "What's your name?"
+- [ ] From the admin chat, send `/start` → straight into Admin Mode, not
+      the customer greeting
+- [ ] Tap 🟢 Open Kitchen / 🔴 Close Kitchen → status flips, and the
+      keyboard's button immediately updates to show the opposite action
+- [ ] Tap 📋 Menu, 📦 Recent Orders, ⚙ Settings → each shows its info
+      and the keyboard reappears afterward
+- [ ] Tap ➕ Add Item → keyboard disappears (hidden for the guided
+      text-entry flow), complete the flow → keyboard reappears with the
+      confirmation message
+- [ ] Mid-`/additem` (or edit/remove), tap what *would* be a menu button
+      if the keyboard were visible — since it's hidden, this isn't
+      possible; confirm the keyboard truly disappeared after tapping
+      "Add Item" and doesn't resurface until the flow ends
+- [ ] Add a second chat ID to `ADMIN_IDS` (comma-separated) → that chat
+      also gets Admin Mode and also receives order notifications
+- [ ] A chat NOT in `ADMIN_IDS`/`ADMIN_CHAT_ID` never sees Admin Mode,
+      regardless of what it sends — always the normal customer flow
+
 ## Admin commands
 
 - [ ] From the admin chat: `/menu` lists current `menu_items` rows
@@ -34,9 +58,13 @@ availability, or orders. Each item names what it's actually verifying.
 - [ ] From a non-admin chat while closed: any message → "kitchen is
       currently closed", order flow does not proceed
 - [ ] From the admin chat: `/open` → availability flips back to `true`
-- [ ] From a **non-admin** chat: `/open`, `/close`, `/menu` all get
-      "not authorized" and do **not** change availability or return the
-      menu
+- [ ] From the admin chat: `/orders` → lists the 10 most recent orders,
+      newest first
+- [ ] From the admin chat: `/settings` → shows kitchen status and the
+      configured admin chat ID(s)
+- [ ] From a **non-admin** chat: every admin command/button gets
+      "not authorized" and does **not** change availability, return the
+      menu, or reveal orders/settings
 
 ## Admin menu management (/additem, /edititem, /removeitem)
 
@@ -54,13 +82,66 @@ availability, or orders. Each item names what it's actually verifying.
 - [ ] `/removeitem` → pick a number → reply anything other than "yes"
       at the confirm step → item is **not** deleted
 - [ ] Mid-flow (any of the three), reply "cancel" → flow stops, no
-      change is made, admin is back to normal
+      change is made, admin is back to Admin Mode dashboard
 - [ ] Send `/edititem` or `/removeitem` when the menu is empty → clear
       message, no crash, no numbered list of nothing
 - [ ] From a **non-admin** chat: `/additem`, `/edititem`, `/removeitem`
       all get "not authorized" and cannot start a flow
 - [ ] While mid-flow, send `/start` → flow is abandoned, session resets
       normally (no leftover draft interferes with the next conversation)
+
+## Natural-language admin commands
+
+- [ ] With "Burger" on the menu, from the admin chat try each of:
+      `/edititem Burger 4000`, `/edit item burger 4000`,
+      `edit burger 4000`, `burger 4000`, `burger is now 4000`,
+      `change burger price to 4000`, `make burger 4500` → each updates
+      Burger's price directly (no extra confirmation step), with a
+      confirmation message and the keyboard restored
+- [ ] `/removeitem Burger`, `remove burger`, `delete burger` → each
+      shows the same confirmation prompt as the guided flow ("Remove
+      'Burger' ... reply yes to confirm") — **not** an immediate delete
+- [ ] `/additem Fries 1500`, `add fries 1500`, `new item fries 1500` →
+      each adds a new "Fries" row (title-cased), available by default,
+      no extra questions asked
+- [ ] Typos: `burgr 4000`, `buger 4000`, `burgar 4000` → all still match
+      "Burger" and update its price
+- [ ] An item name that doesn't resemble anything on the menu (e.g.
+      `xyzfood 500`) → one clarification question asking whether to add
+      it as new or whether they meant an existing item — **no** row
+      created or changed
+- [ ] Two similarly-named items on the menu (e.g. "Chicken" and
+      "Chicken Wings") — a clearly ambiguous typo between them → one
+      clarification question listing both, no mutation until answered
+- [ ] Ordinary admin chat ("thanks", "ok", "how's it going") → dashboard
+      shown as usual, **no** clarification question, no menu lookup
+      triggered
+- [ ] Existing bare slash commands (`/additem` with no args, `/edititem`,
+      `/removeitem`) still start the guided step-by-step flow exactly as
+      before — inline-argument commands don't change this
+- [ ] Existing keyboard buttons (➕ Add Item, ✏ Edit Item, ❌ Remove Item,
+      etc.) still work exactly as before
+- [ ] **From a non-admin/customer chat**, send the exact same text as
+      any case above (e.g. "burger 4000", "remove burger", "add fries
+      1500") → normal customer order-flow/FAQ handling only; menu is
+      **never** modified and no admin-style response appears
+- [ ] Confirm no Gemini call happens for any of the natural-language
+      admin cases above (check server logs / Gemini usage — this is a
+      fully deterministic parser, zero API calls)
+- [ ] From the admin chat, type bare words (no slash, no emoji):
+      `menu`, `orders`, `settings`, `open`, `close` → each triggers the
+      matching action directly, same as the button/slash command
+
+## Latency / timeout budget
+
+- [ ] With a normal (fast) Gemini response, confirm total webhook
+      response time is well under the route's `maxDuration` (10s) —
+      should typically be 1-3s
+- [ ] If reachable, simulate a slow/hanging Gemini response (e.g. a
+      temporarily invalid `GEMINI_MODEL` that causes retries upstream,
+      or throttle network in a local test) → the bot should fail into
+      the fallback reply within ~6s, not hang until Vercel's own
+      timeout fires
 
 ## Error handling / webhook reliability (this round's main fix)
 
@@ -90,10 +171,11 @@ availability, or orders. Each item names what it's actually verifying.
 - [ ] `.env.local` uses `SUPABASE_URL` (not the old
       `NEXT_PUBLIC_SUPABASE_URL`) — if you have an older `.env.local`,
       rename the key or the app will fail to start Supabase calls
-- [ ] `ADMIN_CHAT_ID` set to a real numeric chat id — confirm setting it
-      to an empty string is treated as "not configured" (admin commands
-      and notifications should behave as if unset, not silently use
-      chat id `0`)
+- [ ] `ADMIN_IDS` (preferred) or `ADMIN_CHAT_ID` (legacy fallback) set
+      to real numeric chat id(s) — confirm setting either to an empty
+      string is treated as "not configured" (Admin Mode and
+      notifications should behave as if unset, not silently use chat id
+      `0`)
 
 ## Known limitations (not fixed this round — flagged, not silent)
 
@@ -107,3 +189,14 @@ availability, or orders. Each item names what it's actually verifying.
   eliminated. Worth revisiting if duplicate orders are ever observed in
   practice — likely fix would be an idempotency key on the order or a
   DB-level transaction.
+- With more than one admin configured (`ADMIN_IDS` with multiple IDs),
+  two admins editing the same menu item at nearly the same moment is a
+  last-write-wins race — there's no row-level locking. Low risk for a
+  small single-restaurant bot with occasional admin use; would need
+  explicit locking or optimistic concurrency to fully close.
+- There's a narrow (sub-second to a few seconds) window between
+  `routeConversation` checking `isKitchenOpen()` and a customer's
+  message actually finishing processing, during which an admin could
+  close the kitchen. In that exact window, Gemini's "Kitchen: open"
+  context could be very slightly stale for that one message. Negligible
+  in practice, not actively guarded against.

@@ -36,10 +36,11 @@ live Vercel deployment. For local setup, see `README.md`.
 
 1. If you haven't already, create the bot via [@BotFather](https://t.me/BotFather)
    and grab the bot token.
-2. Get the admin's (Mira's) Telegram chat id — message
-   [@userinfobot](https://t.me/userinfobot) from the account that should
-   be able to run `/open`, `/close`, `/menu` and receive order
-   notifications.
+2. Get the chat id of everyone who should have Admin Mode — message
+   [@userinfobot](https://t.me/userinfobot) from each account. Admin
+   Mode (button menu: Menu, Add/Edit/Remove Item, Open/Close Kitchen,
+   Recent Orders, Settings) replaces the customer flow entirely for
+   these chats, and each also receives order notifications.
 
 Webhook registration happens after deployment (step 4), once you have a
 real HTTPS URL to point Telegram at.
@@ -70,10 +71,12 @@ via the CLI (`vercel env add`) or the dashboard.
 | Variable | Value |
 |---|---|
 | `TELEGRAM_BOT_TOKEN` | from BotFather |
-| `ADMIN_CHAT_ID` | Mira's Telegram chat id |
+| `ADMIN_IDS` | comma-separated chat IDs for everyone who should have Admin Mode (e.g. Mira's) |
 | `SUPABASE_URL` | production Supabase project URL |
 | `SUPABASE_SERVICE_ROLE_KEY` | production service role key |
 | `GEMINI_API_KEY` | Gemini API key |
+| `GEMINI_MODEL` | optional — which Gemini model to use; falls back to a stable Flash model if unset |
+| `RESTAURANT_FAQ` | optional — real opening hours/delivery/policy text for Gemini to answer from |
 | `APP_BASE_URL` | your production URL, e.g. `https://mira-kitchen-bot.vercel.app` |
 
 After adding/changing env vars, redeploy so the running instance picks
@@ -108,8 +111,12 @@ minimum:
 
 - [ ] Message the bot as a normal customer → full order flow completes
 - [ ] Admin chat gets the 🍽️ New Order notification
-- [ ] `/open`, `/close`, `/menu` work from the admin chat and are
-      rejected from any other chat
+- [ ] Message the bot from an admin chat → Admin Mode dashboard appears
+      with the button menu, never the customer greeting
+- [ ] Tap Open/Close Kitchen, Menu, Recent Orders — each works and the
+      keyboard refreshes correctly
+- [ ] From any non-admin chat, `/open`, `/close`, `/menu` etc. are
+      rejected as "not authorized"
 - [ ] Order and session rows appear correctly in the production Supabase
       project
 

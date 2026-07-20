@@ -34,7 +34,14 @@ export async function POST(req: NextRequest) {
       const reply = await routeConversation(session, message.text);
       await saveSession(session);
 
-      await sendMessage(message.chatId, reply);
+      // An empty reply means the message was already sent directly
+      // inside the Conversation Engine (Admin Mode messages need a
+      // ReplyKeyboardMarkup attached, which requires calling
+      // sendMessageWithKeyboard from there instead of returning plain
+      // text for this route to send) — nothing more to do here.
+      if (reply) {
+        await sendMessage(message.chatId, reply);
+      }
     }
   } catch (error) {
     console.error("Failed to process Telegram update:", error);

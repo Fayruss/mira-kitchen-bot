@@ -1,11 +1,27 @@
 // telegram.ts
 // Responsibility: talk to the Telegram Bot API.
 // - parseUpdate: turn a raw webhook payload into a simple message shape
-// - sendMessage: send a text reply to a chat
+// - sendMessage: send a plain text reply to a chat
+// - sendMessageWithKeyboard: send a reply with a custom keyboard
+//   attached (or removed) — used for Admin Mode's button menu
 
 export type TelegramMessage = {
   chatId: number;
   text: string;
+};
+
+// Telegram's ReplyKeyboardMarkup: a persistent custom keyboard shown
+// under the chat's text input. Tapping a button just sends its label
+// back as an ordinary text message — no new update type to handle.
+export type ReplyKeyboardMarkup = {
+  keyboard: string[][];
+  resize_keyboard?: boolean;
+  one_time_keyboard?: boolean;
+};
+
+// Hides a previously-shown ReplyKeyboardMarkup.
+export type ReplyKeyboardRemove = {
+  remove_keyboard: true;
 };
 
 const TELEGRAM_API_BASE = "https://api.telegram.org";
@@ -43,19 +59,35 @@ export function parseUpdate(update: unknown): TelegramMessage | null {
   return { chatId, text };
 }
 
-// Sends a text message to a Telegram chat.
-export async function sendMessage(chatId: number, text: string): Promise<void> {
+// Shared by sendMessage and sendMessageWithKeyboard so the fetch/error
+// handling can't drift out of sync between them.
+async function postMessage(payload: Record<string, unknown>): Promise<void> {
   const token = getBotToken();
   const url = `${TELEGRAM_API_BASE}/bot${token}/sendMessage`;
 
   const response = await fetch(url, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ chat_id: chatId, text }),
+    body: JSON.stringify(payload),
   });
 
   if (!response.ok) {
     const body = await response.text();
     throw new Error(`Telegram sendMessage failed: ${response.status} ${body}`);
   }
+}
+
+// Sends a text message to a Telegram chat.
+export async function sendMessage(chatId: number, text: string): Promise<void> {
+  await postMessage({ chat_id: chatId, text });
+}
+
+// Sends a text message with a custom reply keyboard attached (or
+// removed). Used for Admin Mode's button menu.
+export async function sendMessageWithKeyboard(
+  chatId: number,
+  text: string,
+  replyMarkup: ReplyKeyboardMarkup | ReplyKeyboardRemove
+): Promise<void> {
+  await postMessage({ chat_id: chatId, text, reply_markup: replyMarkup });
 }
